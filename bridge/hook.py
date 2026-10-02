@@ -10,7 +10,8 @@ import time
 
 STATE_DIR = os.path.join(os.path.expanduser("~"), ".claude", "claude-screen")
 KEEP = ("session_id", "cwd", "hook_event_name", "tool_name", "notification_type",
-        "message", "source", "model", "reason", "agent_id", "permission_mode")
+        "message", "source", "model", "reason", "agent_id", "permission_mode",
+        "transcript_path")
 
 
 def summarize_input(tool_input):

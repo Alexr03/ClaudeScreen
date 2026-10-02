@@ -111,6 +111,7 @@ class Session:
         self.last_ts = ts
         self.last_event = ""
         self.model = ""
+        self.transcript = ""
 
     @property
     def name(self):
@@ -138,6 +139,8 @@ class Tracker:
             return
         s.last_ts = ts
         s.last_event = name
+        if ev.get("transcript_path"):
+            s.transcript = ev["transcript_path"]
         if name == "SessionStart" and ev.get("cwd"):
             s.cwd = ev["cwd"]
         tool = ev.get("tool_name") or ""
@@ -291,6 +294,42 @@ def fetch_usage():
     os.replace(path + ".tmp", path)
 
 
+_model_cache = {}
+
+
+def transcript_model(path):
+    """The model of the latest reply in a session transcript.
+
+    Covers sessions started before the hooks were installed, and /model
+    switches mid-session. Only the tail of the file is read, and the result is
+    cached until the file changes.
+    """
+    try:
+        mtime = os.path.getmtime(path)
+    except (OSError, TypeError):
+        return ""
+    hit = _model_cache.get(path)
+    if hit and hit[0] == mtime:
+        return hit[1]
+    model = ""
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        f.seek(max(0, f.tell() - 262144))
+        tail = f.read().decode("utf-8", "replace")
+    for line in reversed(tail.splitlines()):
+        if '"model"' not in line:
+            continue
+        try:
+            m = (json.loads(line).get("message") or {}).get("model")
+        except ValueError:
+            continue
+        if m and m.startswith("claude-"):
+            model = pretty_model(m)
+            break
+    _model_cache[path] = (mtime, model)
+    return model
+
+
 def build_payload(tracker, now):
     statuses = {}
     for path in glob.glob(os.path.join(STATE_DIR, "status-*.json")):
@@ -314,7 +353,7 @@ def build_payload(tracker, now):
             "d": clean(s.detail, 90),
             "a": max(0, int(now - s.since)),
             "c": int(round(ctx)) if isinstance(ctx, (int, float)) else -1,
-            "m": clean(st.get("model") or s.model, 22),
+            "m": clean(st.get("model") or transcript_model(s.transcript) or s.model, 22),
         })
     return {"t": datetime.now().strftime("%H:%M"), "s": out, "l": limits(now)}
 
