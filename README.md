@@ -189,9 +189,12 @@ python bridge/display_config.py panel=2 inv=1
   | Brightness | 100% · 70% · 40% |
   | Status light | the RGB LED on the back: on (pulses amber when Claude needs you) or off |
   | Rotate screen | flip 180° |
+  | Calibrate touch | tap the four corner markers again if taps land in the wrong place |
+  | Firmware | the version running, and the screen's network name |
   | Factory reset | forgets WiFi, paired PCs and settings |
 
-  The first time, it asks you to tap four corner markers, which calibrates the touchscreen.
+  The first time, it asks you to tap four corner markers, which calibrates the touchscreen
+  (redo it any time with **Calibrate touch**).
 - **Factory reset without the touchscreen:** hold the **BOOT** button for 5 seconds while
   it's running. Both kinds of reset keep the display settings (`panel`, `inv`, `bgr`) and the
   touch calibration, so the screen stays readable afterwards.

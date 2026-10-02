@@ -121,7 +121,8 @@ static uint32_t menuTouchMs = 0;  // closes itself after a minute untouched
 static uint8_t brightness = 100;  // percent
 static bool statusLed = true;     // RGB LED on the back
 static uint32_t bootHeldMs = 0;   // BOOT button held: factory reset countdown
-static constexpr int MENU_ROW_Y = 42, MENU_ROW_H = 34, MENU_ROW_GAP = 4, MENU_ROWS = 6;
+static constexpr int MENU_ROW_Y = 42, MENU_ROW_H = 34, MENU_ROW_GAP = 4, MENU_ROWS = 8;
+enum MenuRow { R_WIFI, R_PAIRED, R_BRIGHT, R_LED, R_ROTATE, R_CALIBRATE, R_FIRMWARE, R_RESET };
 static int menuScroll = 0;  // px; drag the list to scroll
 
 static int menuMaxScroll() {
@@ -504,12 +505,13 @@ static void button(int x, int y, int w, int h, const char* label, uint16_t bg, u
 
 static void drawMenu() {
   char buf[64];
-  const char* labels[MENU_ROWS] = {"WiFi", "Paired PCs", "Brightness", "Status light", "Rotate screen", "Factory reset"};
+  const char* labels[MENU_ROWS] = {"WiFi",           "Paired PCs", "Brightness", "Status light", "Rotate screen",
+                                   "Calibrate touch", "Firmware",   "Factory reset"};
   for (int i = 0; i < MENU_ROWS; i++) {
     int y = MENU_ROW_Y + i * (MENU_ROW_H + MENU_ROW_GAP) - menuScroll;
     if (y + MENU_ROW_H < MENU_ROW_Y - 4 || y > H) continue;
     rrect(8, y, 304, MENU_ROW_H, 9, C_CARD);
-    text(fBody, labels[i], 20, y + 22, i == 5 ? C_RED : C_TEXT);
+    text(fBody, labels[i], 20, y + 22, i == R_RESET ? C_RED : C_TEXT);
     buf[0] = 0;
     if (i == 0) {
       if (netUi.wifi) snprintf(buf, sizeof buf, "%s  \xC2\xB7  %s", netUi.ssid, netUi.ip);
@@ -517,7 +519,8 @@ static void drawMenu() {
     }
     if (i == 1) snprintf(buf, sizeof buf, "%d  \xC2\xB7  tap to forget all", pairedCount());
     if (i == 2) snprintf(buf, sizeof buf, "%d%%", brightness);
-    if (i == 3) strlcpy(buf, statusLed ? "on  \xC2\xB7  pulses when Claude needs you" : "off", sizeof buf);
+    if (i == R_LED) strlcpy(buf, statusLed ? "on  \xC2\xB7  pulses when Claude needs you" : "off", sizeof buf);
+    if (i == R_FIRMWARE) snprintf(buf, sizeof buf, "%s  \xC2\xB7  %s", FW_VERSION_STR, netUi.hostname);
     char line[64];
     if (*buf) text(fSmall, fit(fSmall, buf, 190, line, sizeof line), 300, y + 22, C_MUTED, textdatum_t::baseline_right);
   }
@@ -533,7 +536,7 @@ static void drawMenu() {
   // Header on top, so rows scroll underneath it.
   if (OY < MENU_ROW_Y - 4) S->fillRect(0, -OY, W, MENU_ROW_Y - 4, C_BG);
   text(fTitle, "Settings", 16, 25, C_TEXT);
-  snprintf(buf, sizeof buf, "%s  \xC2\xB7  %s", netUi.hostname, FW_VERSION_STR);
+  strlcpy(buf, netUi.name, sizeof buf);
   text(fSmall, buf, 16 + textW(fTitle, "Settings") + 10, 24, C_DIM);
   disc(294, 18, 13, C_CARD);  // close button
   capsule(289, 13, 299, 23, 1.2f, C_MUTED);
@@ -899,27 +902,31 @@ static void menuTap(int x, int y) {
   int row = pos / (MENU_ROW_H + MENU_ROW_GAP);
   if (pos < 0 || row >= MENU_ROWS || pos % (MENU_ROW_H + MENU_ROW_GAP) > MENU_ROW_H) return;
   switch (row) {
-    case 0:
+    case R_WIFI:
       if (netUi.wifi) menuConfirm = C_FORGET_WIFI;
       else if (!netUi.portal) startPortal();
       break;
-    case 1:
+    case R_PAIRED:
       if (pairedCount()) menuConfirm = C_UNPAIR;
       break;
-    case 2:
+    case R_BRIGHT:
       brightness = brightness >= 100 ? 40 : brightness + 30;
       prefs.putUChar("bright", brightness);
       break;
-    case 3:
+    case R_LED:
       statusLed = !statusLed;
       prefs.putBool("led", statusLed);
       break;
-    case 4:
+    case R_ROTATE:
       rotation ^= 2;
       lcd.setRotation(rotation);
       prefs.putUChar("rot", rotation);
       break;
-    case 5: menuConfirm = C_RESET; break;
+    case R_CALIBRATE:
+      calibrateTouch();
+      menuTouchMs = millis();
+      break;
+    case R_RESET: menuConfirm = C_RESET; break;
   }
 }
 
