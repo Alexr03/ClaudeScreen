@@ -442,7 +442,7 @@ def run(args):
 
 
 def setup_logging():
-    if sys.stdout is None or not sys.stdout.isatty():
+    if sys.stdout is None:  # pythonw (autostart) has no console
         os.makedirs(STATE_DIR, exist_ok=True)
         path = os.path.join(STATE_DIR, "bridge.log")
         if os.path.exists(path) and os.path.getsize(path) > 1 << 20:

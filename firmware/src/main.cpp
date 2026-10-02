@@ -378,7 +378,7 @@ static void drawTile(int x, const char* ringLabel, const char* label, const Limi
     }
   } else {
     strlcpy(pct, "\xE2\x80\x94", sizeof pct);
-    strlcpy(rs, "waiting for data", sizeof rs);
+    strlcpy(rs, "no data yet", sizeof rs);
   }
   text(fTitle, ringLabel, rx, ry + 6, C_TEXT, textdatum_t::baseline_center);
   const int tx = x + 68;
