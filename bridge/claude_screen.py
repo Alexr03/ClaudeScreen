@@ -15,9 +15,11 @@ Inputs, all under ~/.claude/claude-screen/ (written by hook.py / statusline.py):
     rate_limits.json    5-hour / weekly plan usage, from the status line
 """
 import argparse
+import getpass
 import glob
 import json
 import os
+import socket
 import sys
 import time
 import unicodedata
@@ -27,6 +29,7 @@ import serial
 import serial.tools.list_ports
 
 STATE_DIR = os.path.join(os.path.expanduser("~"), ".claude", "claude-screen")
+ORIGIN = f"{getpass.getuser()}@{socket.gethostname()}"[:31]  # same label as pairing
 EVENTS = os.path.join(STATE_DIR, "events.jsonl")
 BAUD = 460800
 REPLAY_BYTES = 1 << 20
@@ -359,7 +362,8 @@ def build_payload(tracker, now):
             "c": int(round(ctx)) if isinstance(ctx, (int, float)) else -1,
             "m": clean(st.get("model") or transcript_model(s.transcript) or s.model, 22),
         })
-    return {"t": datetime.now().strftime("%H:%M"), "s": out, "l": limits(now)}
+    # "o" names this PC, so a screen reached over USB and WiFi shows it once.
+    return {"t": datetime.now().strftime("%H:%M"), "o": ORIGIN, "s": out, "l": limits(now)}
 
 
 DEMO = [
@@ -495,7 +499,7 @@ def run(args):
                 print(f"usage check failed: {type(e).__name__}: {e}", flush=True)
 
         if args.demo:
-            payload = dict(DEMO[int(now / 6) % len(DEMO)], t=datetime.now().strftime("%H:%M"))
+            payload = dict(DEMO[int(now / 6) % len(DEMO)], t=datetime.now().strftime("%H:%M"), o=ORIGIN)
         else:
             tracker.read_new()
             tracker.prune(now)

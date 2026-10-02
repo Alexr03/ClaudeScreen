@@ -610,7 +610,8 @@ static int sourceFor(const char* label) {
   return oldest;
 }
 
-static bool usbSeen() { return sources[0].rxMs != 0; }
+static bool usbRx = false;
+static bool usbSeen() { return usbRx; }
 
 static void applyState(JsonDocument& doc, int idx, const char* label) {
   Source& src = sources[idx];
@@ -910,7 +911,12 @@ static void parseLine(char* line) {
   if (deserializeJson(doc, line)) return;
 
   if (!doc["cmd"].is<const char*>()) {
-    applyState(doc, 0, "usb");
+    // A bridge names itself ("o"), so a PC connected over both USB and WiFi
+    // fills one source instead of showing every session twice.
+    usbRx = true;
+    const char* origin = doc["o"] | "";
+    if (*origin) applyState(doc, sourceFor(origin), origin);
+    else applyState(doc, 0, "usb");
     return;
   }
   const char* cmd = doc["cmd"];
