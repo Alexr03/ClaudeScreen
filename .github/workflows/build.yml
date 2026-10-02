@@ -87,13 +87,22 @@ jobs:
           python -m esptool --chip esp32 write-flash 0x0 claudescreen-${VERSION}-full.bin
           \`\`\`
 
-          **Updating ClaudeScreen**, the app image is enough and keeps your display settings:
+          **Screen on WiFi and paired** (v1.1.0 or later): update it from your PC, no cable needed:
+
+          \`\`\`bash
+          python bridge/claude_screen.py update
+          \`\`\`
+
+          **Over USB**, the app image is enough and keeps your settings:
 
           \`\`\`bash
           python -m esptool --chip esp32 write-flash 0x10000 claudescreen-${VERSION}-app.bin
           \`\`\`
 
-          Hold **BOOT** if esptool reports *Wrong boot mode*. Then unzip the bridge and run
+          Coming from v1.0.0, flash the full image once instead: the flash layout changed to
+          make room for WiFi updates. Hold **BOOT** if esptool reports *Wrong boot mode*.
+
+          Then unzip the bridge and run \`pip install -r bridge/requirements.txt\` and
           \`python bridge/install.py\`.
           EOF
           sed -i 's/^          //' notes.md

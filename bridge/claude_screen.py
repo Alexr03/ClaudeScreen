@@ -1,7 +1,11 @@
 """ClaudeScreen bridge: feeds Claude Code activity + plan usage to the display.
 
-    python claude_screen.py                 run (auto-detects the CH340 port)
-    python claude_screen.py --port COM4     run on a specific port
+    python claude_screen.py                 run: USB (auto-detected) + paired WiFi screens
+    python claude_screen.py pair [name]     pair with a screen on the network
+    python claude_screen.py screens         list screens on the network
+    python claude_screen.py unpair <name>   forget a screen
+    python claude_screen.py update [bin]    update paired screens' firmware over WiFi
+    python claude_screen.py --port COM4     use a specific USB port
     python claude_screen.py --demo          cycle through demo states
     python claude_screen.py --shot out.png  save a screenshot of the display
 
@@ -431,32 +435,65 @@ def _rgb565(v):
     return (r << 3 | r >> 2, g << 2 | g >> 4, b << 3 | b >> 2)
 
 
+class SerialLink:
+    """The USB connection, reopened whenever the board comes back."""
+
+    def __init__(self, port):
+        self.port = port
+        self.ser = None
+        self.retry_at = 0.0
+        self.warned = False
+
+    def send(self, text):
+        if self.ser is None:
+            if time.time() < self.retry_at:
+                return
+            self.retry_at = time.time() + 3
+            port = self.port or find_port()
+            if not port:
+                if not self.warned:
+                    print("no screen on USB", flush=True)
+                    self.warned = True
+                return
+            try:
+                self.ser = open_port(port)
+                print(f"connected on {port}", flush=True)
+                self.warned = False
+            except serial.SerialException as e:
+                print(f"can't open {port}: {e}", flush=True)
+                return
+        try:
+            self.ser.write(text.encode("utf-8"))
+            self.ser.read(self.ser.in_waiting or 0)  # discard anything the board printed
+        except serial.SerialException as e:
+            print(f"lost USB screen: {e}", flush=True)
+            self.ser.close()
+            self.ser = None
+
+
 def run(args):
     tracker = Tracker()
     tracker.read_new(replay=True)
-    ser, last_sent, last_payload, demo_i = None, 0.0, None, 0
-    next_usage = 0.0
+    links = []
+    if not args.no_usb:
+        links.append(SerialLink(args.port))
+    if not args.no_wifi:
+        try:
+            from network import Network
+            links.append(Network(lambda msg: print(msg, flush=True)))
+        except ImportError as e:
+            print(f"WiFi screens disabled ({e}); pip install zeroconf websocket-client", flush=True)
+
+    last_sent, last_payload, next_usage = 0.0, None, 0.0
     while True:
-        if not args.demo and time.time() >= next_usage:
-            next_usage = time.time() + USAGE_EVERY
+        now = time.time()
+        if not args.demo and now >= next_usage:
+            next_usage = now + USAGE_EVERY
             try:
                 fetch_usage()
             except Exception as e:  # keep whatever the status line last gave us
                 print(f"usage check failed: {type(e).__name__}: {e}", flush=True)
-        if ser is None:
-            port = args.port or find_port()
-            try:
-                if not port:
-                    raise serial.SerialException("no ESP32 serial port found")
-                ser = open_port(port)
-                print(f"connected on {port}", flush=True)
-                last_payload = None
-            except serial.SerialException as e:
-                print(f"waiting for display: {e}", flush=True)
-                time.sleep(3)
-                continue
 
-        now = time.time()
         if args.demo:
             payload = dict(DEMO[int(now / 6) % len(DEMO)], t=datetime.now().strftime("%H:%M"))
         else:
@@ -468,14 +505,9 @@ def run(args):
         # so comparing without them avoids resending every tick).
         key = json.dumps({**payload, "s": [{**s, "a": 0} for s in payload["s"]]}, sort_keys=True)
         if key != last_payload or now - last_sent >= 1.0:
-            try:
-                send(ser, payload)
-                ser.read(ser.in_waiting or 0)  # discard anything the board printed
-            except serial.SerialException as e:
-                print(f"lost display: {e}", flush=True)
-                ser.close()
-                ser = None
-                continue
+            text = json.dumps(payload, separators=(",", ":"), ensure_ascii=False) + "\n"
+            for link in links:
+                link.send(text)
             last_payload, last_sent = key, now
         time.sleep(0.15)
 
@@ -491,14 +523,32 @@ def setup_logging():
 
 
 def main():
-    setup_logging()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--port")
+    ap.add_argument("command", nargs="?", choices=["run", "pair", "screens", "unpair", "update"], default="run")
+    ap.add_argument("target", nargs="?", help="screen name or id (pair / unpair), or firmware image (update)")
+    ap.add_argument("--screen", help="update: only this screen")
+    ap.add_argument("--port", help="USB serial port (default: auto-detect)")
+    ap.add_argument("--no-usb", action="store_true", help="only send to WiFi screens")
+    ap.add_argument("--no-wifi", action="store_true", help="only send over USB")
     ap.add_argument("--demo", action="store_true")
     ap.add_argument("--shot", metavar="PNG")
     ap.add_argument("--demo-frame", type=int, default=0, help="with --shot: which demo state to show")
     args = ap.parse_args()
 
+    if args.command != "run":
+        import network
+        if args.command == "pair":
+            return network.pair(args.target)
+        if args.command == "screens":
+            return network.list_screens()
+        if args.command == "update":
+            import ota
+            return ota.update(args.target, args.screen)
+        if not args.target:
+            ap.error("unpair needs a screen name or id")
+        return network.unpair(args.target)
+
+    setup_logging()
     if args.shot:
         ser = open_port(args.port or find_port())
         if args.demo:

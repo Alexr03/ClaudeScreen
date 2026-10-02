@@ -1,10 +1,14 @@
 // ClaudeScreen - Claude Code activity + plan usage on an ESP32-2432S028.
 //
-// The PC bridge (bridge/claude_screen.py) streams one JSON line per second:
+// PC bridges (bridge/claude_screen.py) send one JSON object per second, over
+// USB serial and/or a WebSocket (see net.h):
 //   {"t":"14:32","s":[{"n":"proj","st":"work","v":"Editing","d":"main.cpp",
 //    "a":42,"c":31,"m":"Opus 5.5"}],"l":{"h5":[23.5,8040],"d7":[41,300000]}}
 // st: work | wait | idle.  a: seconds in this state.  c: context % (-1 unknown).
 // l.*: [used %, seconds until reset]; a missing window means "unknown".
+//
+// Each sender is a "source" (USB, or a paired PC). The screen merges the
+// sessions of all live sources, most urgent first.
 //
 // The frame is rendered in 40px bands into two ping-pong sprites so a full
 // 16-bit frame never has to fit in RAM, and each band's DMA transfer overlaps
@@ -17,6 +21,11 @@
 
 #include "board.h"
 #include "fonts.h"
+
+#ifndef FW_VERSION
+#define FW_VERSION "dev"  // release builds pass the git tag
+#endif
+#define FW_VERSION_STR FW_VERSION
 
 // ---------------------------------------------------------------- palette --
 
@@ -38,6 +47,7 @@ static constexpr uint16_t C_RED = rgb(0xE5, 0x5F, 0x4C);
 // ----------------------------------------------------------------- state --
 
 struct Session {
+  uint8_t src;  // which source it came from
   char name[40];
   char state;  // 'w' working, 'q' waiting on user, 'i' idle
   char verb[24];
@@ -50,19 +60,67 @@ struct Session {
 struct Limit {
   bool known = false;
   float pct = 0;
-  int32_t reset = 0;  // seconds, relative to rxMs
+  int32_t reset = 0;  // seconds until reset, as of the source's rxMs
 };
 
-static constexpr int MAX_SESS = 6;
-static Session sess[MAX_SESS];
+static constexpr int MAX_SESS = 6;   // per source
+static constexpr int MAX_SRC = 5;    // 0 = USB, 1.. = PCs on the network
+static constexpr int MAX_VIEW = 8;   // sessions on screen
+static constexpr uint32_t STALE_MS = 6000;
+
+struct Source {
+  char label[32];  // "usb" or the PC's pairing label
+  Session s[MAX_SESS];
+  int n = 0;
+  Limit l5, l7;
+  char clock[8] = "";
+  uint32_t rxMs = 0;  // 0 = never
+};
+static Source sources[MAX_SRC];
+
+// The merged view the drawing code reads, rebuilt before every frame. Ages and
+// reset timers in it are already brought up to date.
+static Session sess[MAX_VIEW];
 static int nSess = 0;
 static Limit lim5h, lim7d;
 static char clockStr[8] = "";
-static uint32_t rxMs = 0;  // when the last update arrived
+static uint32_t lastRxMs = 0;  // newest update from any source
 static bool everConnected = false;
+static bool multiSource = false;  // more than one PC live: label sessions
 
-static int focus = 0;             // which session the hero card shows
+static int focus = 0;               // which session the hero card shows
 static uint32_t manualFocusMs = 0;  // non-zero while the user picked one by tapping
+static uint8_t focusSrc = 0;
+static char focusName[40] = "";
+
+// Network status, filled in by net.h and read by the drawing code.
+struct NetUi {
+  char id[8] = "";
+  char hostname[32] = "";
+  char name[40] = "";
+  char ip[16] = "";
+  bool wifi = false;
+  bool portal = false;
+  char apName[32] = "";
+  char apPass[12] = "";
+  bool pairing = false;
+  char pairCode[8] = "";
+  char pairLabel[32] = "";
+  uint32_t pairUntil = 0;
+  int otaPct = -1;
+  char ssid[33] = "";
+};
+static NetUi netUi;
+static int pairedCount();  // net.h
+
+// Settings menu, opened with a long press.
+enum Confirm { C_NONE, C_FORGET_WIFI, C_UNPAIR, C_RESET };
+static bool menuOpen = false;
+static Confirm menuConfirm = C_NONE;
+static uint32_t menuTouchMs = 0;  // closes itself after a minute untouched
+static uint8_t brightness = 100;  // percent
+static uint32_t bootHeldMs = 0;   // BOOT button held: factory reset countdown
+static constexpr int MENU_ROW_Y = 42, MENU_ROW_H = 34, MENU_ROW_GAP = 4;
 
 // ------------------------------------------------------------- hardware --
 
@@ -250,8 +308,20 @@ static uint16_t usageColor(float pct) {
 // ------------------------------------------------------------------ scene --
 
 static float T;  // animation clock, seconds
-static bool online() { return everConnected && millis() - rxMs < 6000; }
-static uint32_t sinceRx() { return (millis() - rxMs) / 1000; }
+static bool online() { return everConnected && millis() - lastRxMs < STALE_MS; }
+
+// Three arcs and a dot, bottom-centred on (x, y).
+static void wifiGlyph(float x, float y, uint16_t col) {
+  for (int i = 0; i < 3; i++) {
+    float r = 3.5f + i * 3.6f;
+    paintSDF(x - r - 2, y - r - 2, x + r + 2, y + 1, col, 1, [&](float px, float py) {
+      float dx = px - x, dy = py - y;
+      if (fabsf(atan2f(dx, -dy)) > 0.8f) return 9.0f;
+      return fabsf(sqrtf(dx * dx + dy * dy) - r) - 0.9f;
+    });
+  }
+  disc(x, y - 0.5f, 1.4f, col);
+}
 
 static void drawHeader() {
   bool working = online() && nSess > 0 && sess[focus].state == 'w';
@@ -265,7 +335,12 @@ static void drawHeader() {
     rrect(x, 8, pw, 19, 9, C_CARD);
     text(fSmall, model, x + 8, 22, C_MUTED);
   }
-  if (online()) text(fTitle, clockStr, 312, 23, C_MUTED, textdatum_t::baseline_right);
+  int cr = 312;
+  if (online()) {
+    text(fTitle, clockStr, cr, 23, C_MUTED, textdatum_t::baseline_right);
+    cr -= textW(fTitle, clockStr) + 10;
+  }
+  if (netUi.wifi) wifiGlyph(cr - 7, 22, C_DIM);
 }
 
 static void drawHero() {
@@ -275,11 +350,39 @@ static void drawHero() {
   const int tx = 94, tr = cx + cw - 12, tw = tr - tx;
   char buf[112], line[112];
 
+  if (netUi.pairing) {
+    uint32_t left = netUi.pairUntil > millis() ? (netUi.pairUntil - millis()) / 1000 : 0;
+    glow(ox, oy, 44, C_AMBER, 0.14f + 0.08f * sinf(T * 3));
+    spark(ox, oy, 25, C_AMBER, T, 0, 0);
+    text(fSmall, "PAIRING REQUEST", tx, 54, C_AMBER);
+    snprintf(buf, sizeof buf, "from %s", netUi.pairLabel);
+    text(fSmall, fit(fSmall, buf, tw - 110, line, sizeof line), tr, 54, C_MUTED, textdatum_t::baseline_right);
+    snprintf(buf, sizeof buf, "%.3s %.3s", netUi.pairCode, netUi.pairCode + 3);
+    text(fHero, buf, tx, 88, C_TEXT);
+    snprintf(buf, sizeof buf, "enter this code on that PC  \xC2\xB7  %us", (unsigned)left);
+    text(fSmall, buf, tx, 112, C_DIM);
+    return;
+  }
   if (!online()) {
     spark(ox, oy, 24, C_DIM, T, 0, 0);
-    text(fSmall, everConnected ? "CONNECTION LOST" : "CLAUDESCREEN", tx, 56, C_DIM);
-    text(fHero, "Waiting for PC", tx, 88, C_MUTED);
-    text(fMono, "run claude_screen.py", tx, 108, C_DIM);
+    if (netUi.portal) {
+      text(fSmall, "WIFI SETUP", tx, 54, C_MUTED);
+      text(fHero, "Set up WiFi", tx, 85, C_TEXT);
+      snprintf(buf, sizeof buf, "join %s", netUi.apName);
+      text(fMono, fit(fMono, buf, tw, line, sizeof line), tx, 104, C_TEXT);
+      snprintf(buf, sizeof buf, "password %s", netUi.apPass);
+      text(fMono, buf, tx, 122, C_MUTED);
+      return;
+    }
+    text(fSmall, everConnected ? "CONNECTION LOST" : "CLAUDESCREEN", tx, 54, C_DIM);
+    text(fHero, "Waiting for PC", tx, 85, C_MUTED);
+    if (netUi.wifi) {
+      snprintf(buf, sizeof buf, "%s.local", netUi.hostname);
+      text(fMono, fit(fMono, buf, tw, line, sizeof line), tx, 104, C_DIM);
+      text(fSmall, pairedCount() ? netUi.ip : "pair: claude_screen.py pair", tx, 122, C_DIM);
+    } else {
+      text(fMono, "connect USB or WiFi", tx, 104, C_DIM);
+    }
     return;
   }
   if (nSess == 0) {
@@ -309,11 +412,12 @@ static void drawHero() {
 
   // Line 1: project (+ counter), time in this state on the right.
   char age[16];
-  fmtDur(s.age + sinceRx(), age, sizeof age, true);
+  fmtDur(s.age, age, sizeof age, true);
   int ageW = textW(fMono, age);
   text(fMono, age, tr, 54, C_DIM, textdatum_t::baseline_right);
-  if (nSess > 1) snprintf(buf, sizeof buf, "%s  \xC2\xB7  %d of %d", s.name, focus + 1, nSess);
-  else strlcpy(buf, s.name, sizeof buf);
+  int n = snprintf(buf, sizeof buf, "%s", s.name);
+  if (multiSource) n += snprintf(buf + n, sizeof buf - n, "  \xC2\xB7  %s", sources[s.src].label);
+  if (nSess > 1) snprintf(buf + n, sizeof buf - n, "  \xC2\xB7  %d of %d", focus + 1, nSess);
   text(fSmall, fit(fSmall, buf, tw - ageW - 10, line, sizeof line), tx, 54, C_MUTED);
 
   // Line 2: the big verb. Line 3: detail.
@@ -364,7 +468,7 @@ static void drawTile(int x, const char* ringLabel, const char* label, const Limi
   arc(rx, ry, 22, 3.6f, 1, C_TRACK);
 
   char pct[12], rs[32], d[16];
-  int32_t left = l.known ? l.reset - (int32_t)sinceRx() : 0;
+  int32_t left = l.known ? l.reset : 0;
   bool expired = l.known && left <= 0;  // window rolled over since we heard
   float p = 0;
   if (l.known) {
@@ -387,13 +491,74 @@ static void drawTile(int x, const char* ringLabel, const char* label, const Limi
   text(fSmall, rs, tx, y + 63, C_DIM);
 }
 
+static void button(int x, int y, int w, int h, const char* label, uint16_t bg, uint16_t fg) {
+  rrect(x, y, w, h, 10, bg);
+  text(fBody, label, x + w / 2, y + h / 2 + 5, fg, textdatum_t::baseline_center);
+}
+
+static void drawMenu() {
+  char buf[64];
+  text(fTitle, "Settings", 16, 25, C_TEXT);
+  snprintf(buf, sizeof buf, "%s  \xC2\xB7  %s", netUi.hostname, FW_VERSION_STR);
+  text(fSmall, buf, 16 + textW(fTitle, "Settings") + 10, 24, C_DIM);
+  disc(294, 18, 13, C_CARD);  // close button
+  capsule(289, 13, 299, 23, 1.2f, C_MUTED);
+  capsule(299, 13, 289, 23, 1.2f, C_MUTED);
+
+  const char* labels[] = {"WiFi", "Paired PCs", "Brightness", "Rotate screen", "Factory reset"};
+  for (int i = 0; i < 5; i++) {
+    int y = MENU_ROW_Y + i * (MENU_ROW_H + MENU_ROW_GAP);
+    rrect(8, y, 304, MENU_ROW_H, 9, C_CARD);
+    text(fBody, labels[i], 20, y + 22, i == 4 ? C_RED : C_TEXT);
+    buf[0] = 0;
+    if (i == 0) {
+      if (netUi.wifi) snprintf(buf, sizeof buf, "%s  \xC2\xB7  %s", netUi.ssid, netUi.ip);
+      else strlcpy(buf, netUi.portal ? "setup network on" : "off  \xC2\xB7  tap to set up", sizeof buf);
+    }
+    if (i == 1) snprintf(buf, sizeof buf, "%d  \xC2\xB7  tap to forget all", pairedCount());
+    if (i == 2) snprintf(buf, sizeof buf, "%d%%", brightness);
+    char line[64];
+    if (*buf) text(fSmall, fit(fSmall, buf, 190, line, sizeof line), 300, y + 22, C_MUTED, textdatum_t::baseline_right);
+  }
+
+  if (menuConfirm != C_NONE) {
+    const char* title = menuConfirm == C_FORGET_WIFI ? "Forget WiFi?"
+                      : menuConfirm == C_UNPAIR      ? "Forget all paired PCs?"
+                                                     : "Factory reset?";
+    const char* sub = menuConfirm == C_FORGET_WIFI ? "The screen will start its setup network."
+                    : menuConfirm == C_UNPAIR      ? "Each PC will need to pair again."
+                                                   : "Forgets WiFi, paired PCs and settings.";
+    rrect(24, 62, 272, 120, 14, C_TRACK);
+    text(fTitle, title, 160, 92, C_TEXT, textdatum_t::baseline_center);
+    text(fSmall, sub, 160, 114, C_MUTED, textdatum_t::baseline_center);
+    button(40, 130, 114, 36, "Cancel", C_CARD, C_TEXT);
+    button(166, 130, 114, 36, menuConfirm == C_RESET ? "Reset" : "Forget", C_RED, C_TEXT);
+  }
+}
+
+static void drawResetCountdown() {
+  int left = 5 - (int)((millis() - bootHeldMs) / 1000);
+  rrect(24, 70, 272, 100, 14, C_TRACK);
+  text(fTitle, "Factory reset", 160, 102, C_RED, textdatum_t::baseline_center);
+  char buf[48];
+  snprintf(buf, sizeof buf, "keep holding BOOT  \xC2\xB7  %ds", max(left, 0));
+  text(fSmall, buf, 160, 126, C_MUTED, textdatum_t::baseline_center);
+  text(fSmall, "release to cancel", 160, 146, C_DIM, textdatum_t::baseline_center);
+}
+
 static void drawScene() {
   S->fillSprite(C_BG);
+  if (menuOpen) {
+    drawMenu();
+    if (bootHeldMs) drawResetCountdown();
+    return;
+  }
   drawHeader();
   drawHero();
   drawChips();
   drawTile(8, "5h", "Session", lim5h);
   drawTile(164, "7d", "Weekly", lim7d);
+  if (bootHeldMs) drawResetCountdown();
 }
 
 // ----------------------------------------------------------------- render --
@@ -427,46 +592,35 @@ static void renderFrame() {
   if (shot) Serial.flush();
 }
 
-// ----------------------------------------------------------------- serial --
+// ---------------------------------------------------------------- sources --
 
-static void parseLine(char* line) {
-  JsonDocument doc;
-  if (deserializeJson(doc, line)) return;
+static void wake();
 
-  if (doc["cmd"].is<const char*>()) {
-    if (!strcmp(doc["cmd"], "shot")) shotRequested = true;
-    if (!strcmp(doc["cmd"], "ping")) printInfo();
-    // Display settings, stored in flash. "panel": 0 auto, 1 ILI9341, 2 ST7789;
-    // "inv": 0 auto, 1 off, 2 on; "bgr": 0/1; "rot": 0-3. Panel changes reboot.
-    if (!strcmp(doc["cmd"], "set")) {
-      bool reboot = false;
-      for (const char* k : {"panel", "inv", "bgr"})
-        if (doc[k].is<int>()) {
-          prefs.putUChar(k, doc[k].as<int>());
-          reboot = true;
-        }
-      if (doc["rot"].is<int>()) {
-        rotation = doc["rot"].as<int>() & 3;
-        prefs.putUChar("rot", rotation);
-        lcd.setRotation(rotation);
-      }
-      printInfo();
-      if (reboot) {
-        Serial.flush();
-        ESP.restart();
-      }
-    }
-    return;
+// The source slot for a PC label, reusing its old slot after a reconnect.
+static int sourceFor(const char* label) {
+  int oldest = 1;
+  for (int i = 1; i < MAX_SRC; i++) {
+    if (!strcmp(sources[i].label, label)) return i;
+    if (sources[i].rxMs < sources[oldest].rxMs) oldest = i;
   }
+  for (int i = 1; i < MAX_SRC; i++)
+    if (!sources[i].label[0]) oldest = i;
+  sources[oldest] = Source();
+  strlcpy(sources[oldest].label, label, sizeof sources[oldest].label);
+  return oldest;
+}
 
-  char prevName[40] = "";
-  if (nSess > 0) strlcpy(prevName, sess[focus].name, sizeof prevName);
+static bool usbSeen() { return sources[0].rxMs != 0; }
 
-  strlcpy(clockStr, doc["t"] | "", sizeof clockStr);
-  nSess = 0;
+static void applyState(JsonDocument& doc, int idx, const char* label) {
+  Source& src = sources[idx];
+  strlcpy(src.label, label, sizeof src.label);
+  strlcpy(src.clock, doc["t"] | "", sizeof src.clock);
+  src.n = 0;
   for (JsonObject o : doc["s"].as<JsonArray>()) {
-    if (nSess >= MAX_SESS) break;
-    Session& s = sess[nSess++];
+    if (src.n >= MAX_SESS) break;
+    Session& s = src.s[src.n++];
+    s.src = idx;
     strlcpy(s.name, o["n"] | "", sizeof s.name);
     const char* st = o["st"] | "idle";
     s.state = !strcmp(st, "work") ? 'w' : !strcmp(st, "wait") ? 'q' : 'i';
@@ -476,7 +630,6 @@ static void parseLine(char* line) {
     s.ctx = o["c"] | -1;
     strlcpy(s.model, o["m"] | "", sizeof s.model);
   }
-
   auto readLimit = [&](const char* key, Limit& l) {
     JsonArray a = doc["l"][key];
     l.known = !a.isNull() && a.size() >= 2;
@@ -485,20 +638,317 @@ static void parseLine(char* line) {
       l.reset = a[1].as<int32_t>();
     }
   };
-  readLimit("h5", lim5h);
-  readLimit("d7", lim7d);
+  readLimit("h5", src.l5);
+  readLimit("d7", src.l7);
+  src.rxMs = millis();
+  lastRxMs = src.rxMs;
+  everConnected = true;
+}
 
-  // The bridge sorts by urgency, so session 0 is the one to show - unless
-  // the user tapped to pick another one recently; then keep following it.
+// Merge every live source into the view: waiting sessions first, then
+// working, then idle, each in the order their bridge sent them.
+static void rebuildView() {
+  uint32_t now = millis();
+  int live = 0, newest = -1;
+  for (int i = 0; i < MAX_SRC; i++) {
+    const Source& s = sources[i];
+    if (!s.rxMs || now - s.rxMs >= STALE_MS) continue;
+    live++;
+    if (newest < 0 || s.rxMs > sources[newest].rxMs) newest = i;
+  }
+  multiSource = live > 1;
+  strlcpy(clockStr, newest >= 0 ? sources[newest].clock : "", sizeof clockStr);
+
+  nSess = 0;
+  for (char prio : {'q', 'w', 'i'})
+    for (int i = 0; i < MAX_SRC; i++) {
+      const Source& src = sources[i];
+      if (!src.rxMs || now - src.rxMs >= STALE_MS) continue;
+      for (int k = 0; k < src.n && nSess < MAX_VIEW; k++) {
+        if (src.s[k].state != prio) continue;
+        sess[nSess] = src.s[k];
+        sess[nSess].age += (now - src.rxMs) / 1000;
+        nSess++;
+      }
+    }
+
+  // The most urgent session gets the hero card - unless the user tapped to
+  // pick one in the last 30s; then keep following that one.
   focus = 0;
-  if (manualFocusMs && millis() - manualFocusMs < 30000) {
+  if (manualFocusMs && now - manualFocusMs < 30000) {
     for (int i = 0; i < nSess; i++)
-      if (!strcmp(sess[i].name, prevName)) focus = i;
+      if (sess[i].src == focusSrc && !strcmp(sess[i].name, focusName)) focus = i;
   } else {
     manualFocusMs = 0;
   }
-  rxMs = millis();
-  everConnected = true;
+
+  // Usage belongs to an account, so show the focused session's PC's numbers.
+  int limSrc = nSess ? sess[focus].src : newest;
+  if (limSrc >= 0 && !sources[limSrc].l5.known && !sources[limSrc].l7.known) limSrc = newest;
+  lim5h = lim7d = Limit();
+  if (limSrc >= 0) {
+    int32_t elapsed = (now - sources[limSrc].rxMs) / 1000;
+    lim5h = sources[limSrc].l5;
+    lim7d = sources[limSrc].l7;
+    lim5h.reset -= elapsed;
+    lim7d.reset -= elapsed;
+  }
+}
+
+// ------------------------------------------------------- touch / backlight --
+
+static uint32_t lastWakeMs = 0;
+static char lastSignature[64] = "";
+
+static void wake() { lastWakeMs = millis(); }
+
+static void openMenu();
+static void menuTap(int x, int y);
+
+static void pollTouch() {
+  static uint32_t downMs = 0;
+  static bool held = false;
+  static int32_t tx = 0, ty = 0;
+  int32_t x, y;
+  bool down = lcd.getTouch(&x, &y);
+  if (down) {
+    tx = x;
+    ty = y;
+  }
+  if (down && !downMs) {
+    downMs = millis();
+    held = false;
+  }
+  if (down && !held && !menuOpen && millis() - downMs > 1000) {  // long press: settings
+    held = true;
+    openMenu();
+  }
+  if (!down && downMs) {
+    bool wasDim = millis() - lastWakeMs > 10 * 60000;
+    if (!held && millis() - downMs > 30 && !wasDim) {
+      if (menuOpen) {
+        menuTap(tx, ty);
+      } else if (nSess > 1) {
+        const Session& next = sess[(focus + 1) % nSess];
+        focusSrc = next.src;
+        strlcpy(focusName, next.name, sizeof focusName);
+        manualFocusMs = millis();
+      }
+    }
+    wake();
+    downMs = 0;
+  }
+}
+
+static void updateBacklightAndLed() {
+  // Anything changing on screen counts as activity and keeps it bright.
+  char sig[64];
+  snprintf(sig, sizeof sig, "%d|%d|%c|%s|%d|%d", online(), nSess, nSess ? sess[0].state : '-',
+           nSess ? sess[0].verb : "", netUi.pairing, netUi.portal);
+  bool busy = false;
+  for (int i = 0; i < nSess; i++) busy |= sess[i].state != 'i';
+  if (strcmp(sig, lastSignature) || (online() && busy)) {
+    strlcpy(lastSignature, sig, sizeof lastSignature);
+    wake();
+  }
+  uint32_t idle = millis() - lastWakeMs;
+  uint8_t full = brightness * 255 / 100;
+  uint8_t target = idle < 10 * 60000 || menuOpen ? full : (online() ? 40 : 6);
+  static float level = 255;
+  level += (target - level) * 0.08f;
+  lcd.setBrightness((uint8_t)level);
+
+  // Back-side RGB LED (active low): breathe amber while Claude waits on you.
+  bool waiting = online() && nSess > 0 && sess[0].state == 'q';
+  float b = waiting ? 0.5f + 0.5f * sinf(T * 4) : 0;
+  ledcWrite(1, 255 - (uint8_t)(b * 255));
+  ledcWrite(2, 255 - (uint8_t)(b * 70));
+  ledcWrite(3, 255);
+}
+
+// Drawn straight to the panel: the main loop is blocked during an update.
+static void drawOtaProgress() {
+  lcd.setBrightness(255);
+  lcd.startWrite();
+  lcd.fillRect(0, 90, W, 70, C_BG);
+  lcd.setFont(&fTitle);
+  lcd.setTextColor(C_TEXT, C_BG);
+  lcd.setTextDatum(textdatum_t::baseline_center);
+  char buf[32];
+  snprintf(buf, sizeof buf, "Updating firmware  %d%%", netUi.otaPct);
+  lcd.drawString(buf, W / 2, 112);
+  lcd.fillRoundRect(40, 128, W - 80, 8, 4, C_TRACK);
+  lcd.fillRoundRect(40, 128, (W - 80) * netUi.otaPct / 100, 8, 4, C_CORAL);
+  lcd.endWrite();
+}
+
+// ------------------------------------------------------------------ setup --
+
+static uint32_t panelId = 0;
+
+#include "net.h"
+
+// ------------------------------------------------------------------ menu --
+
+static void loadTouchCalibration() {
+  uint16_t cal[8];
+  if (prefs.getBytes("tcal", cal, sizeof cal) == sizeof cal) lcd.setTouchCalibrate(cal);
+}
+
+// Tap the four corners: makes taps land where they should on this panel.
+static void calibrateTouch() {
+  lcd.setBrightness(255);
+  lcd.fillScreen(C_BG);
+  lcd.setFont(&fTitle);
+  lcd.setTextColor(C_TEXT, C_BG);
+  lcd.setTextDatum(textdatum_t::middle_center);
+  lcd.drawString("Touch calibration", W / 2, H / 2 - 12);
+  lcd.setFont(&fSmall);
+  lcd.setTextColor(C_MUTED, C_BG);
+  lcd.drawString("tap each corner marker as it appears", W / 2, H / 2 + 12);
+  delay(1500);
+  uint16_t cal[8];
+  lcd.calibrateTouch(cal, C_CORAL, C_BG, 14);
+  prefs.putBytes("tcal", cal, sizeof cal);
+  lcd.setTouchCalibrate(cal);
+  lcd.fillScreen(C_BG);
+}
+
+static void openMenu() {
+  if (!prefs.isKey("tcal")) calibrateTouch();
+  menuOpen = true;
+  menuConfirm = C_NONE;
+  menuTouchMs = millis();
+}
+
+// Keeps the panel settings (wrong ones can leave the screen unreadable) and
+// the touch calibration; everything else goes.
+static void factoryReset() {
+  uint8_t panel = prefs.getUChar("panel", 0), inv = prefs.getUChar("inv", 0), bgr = prefs.getUChar("bgr", 0);
+  uint16_t cal[8];
+  bool hasCal = prefs.getBytes("tcal", cal, sizeof cal) == sizeof cal;
+  prefs.clear();
+  prefs.putUChar("panel", panel);
+  prefs.putUChar("inv", inv);
+  prefs.putUChar("bgr", bgr);
+  if (hasCal) prefs.putBytes("tcal", cal, sizeof cal);
+  wm.resetSettings();
+  WiFi.disconnect(true, true);
+  lcd.fillScreen(C_BG);
+  delay(200);
+  ESP.restart();
+}
+
+static void menuTap(int x, int y) {
+  menuTouchMs = millis();
+  if (menuConfirm != C_NONE) {
+    if (y >= 120 && y <= 176) {
+      if (x >= 160) {
+        if (menuConfirm == C_FORGET_WIFI) {
+          forgetWifi();
+          startPortal();
+        } else if (menuConfirm == C_UNPAIR) {
+          memset(paired, 0, sizeof paired);
+          savePaired();
+          for (int i = 0; i < WEBSOCKETS_SERVER_CLIENT_MAX; i++) ws.disconnect(i);
+        } else if (menuConfirm == C_RESET) {
+          factoryReset();
+        }
+      }
+      menuConfirm = C_NONE;
+    }
+    return;
+  }
+  if (x > 260 && y < 38) {  // close
+    menuOpen = false;
+    return;
+  }
+  int row = (y - MENU_ROW_Y) / (MENU_ROW_H + MENU_ROW_GAP);
+  if (y < MENU_ROW_Y || row > 4) return;
+  switch (row) {
+    case 0:
+      if (netUi.wifi) menuConfirm = C_FORGET_WIFI;
+      else if (!netUi.portal) startPortal();
+      break;
+    case 1:
+      if (pairedCount()) menuConfirm = C_UNPAIR;
+      break;
+    case 2:
+      brightness = brightness >= 100 ? 40 : brightness + 30;
+      prefs.putUChar("bright", brightness);
+      break;
+    case 3:
+      rotation ^= 2;
+      lcd.setRotation(rotation);
+      prefs.putUChar("rot", rotation);
+      break;
+    case 4: menuConfirm = C_RESET; break;
+  }
+}
+
+// BOOT (GPIO0) held for 5 seconds: factory reset, for when touch won't do.
+static void pollBootButton() {
+  bool down = digitalRead(0) == LOW;
+  if (down && !bootHeldMs) bootHeldMs = millis();
+  if (!down) bootHeldMs = 0;
+  if (bootHeldMs && millis() - bootHeldMs > 5000) factoryReset();
+  if (menuOpen && millis() - menuTouchMs > 60000) menuOpen = false;
+}
+
+static void printInfo() {
+  Serial.printf("PONG claudescreen 2 fw=%s panel=%s id=%06lx inv=%d bgr=%d rot=%d host=%s name=\"%s\" wifi=%s ip=%s paired=%d\n",
+                FW_VERSION, lcd.isST7789 ? "st7789" : "ili9341", (unsigned long)panelId, prefs.getUChar("inv", 0),
+                prefs.getUChar("bgr", 0), rotation, netUi.hostname, netUi.name,
+                netUi.wifi ? WiFi.SSID().c_str() : (netUi.portal ? "setup" : "off"), netUi.wifi ? netUi.ip : "-",
+                pairedCount());
+}
+
+// ----------------------------------------------------------------- serial --
+
+static void parseLine(char* line) {
+  JsonDocument doc;
+  if (deserializeJson(doc, line)) return;
+
+  if (!doc["cmd"].is<const char*>()) {
+    applyState(doc, 0, "usb");
+    return;
+  }
+  const char* cmd = doc["cmd"];
+  if (!strcmp(cmd, "shot")) shotRequested = true;
+  if (!strcmp(cmd, "ping")) printInfo();
+  if (!strcmp(cmd, "unpair")) {  // forget every paired PC
+    memset(paired, 0, sizeof paired);
+    savePaired();
+    for (int i = 0; i < WEBSOCKETS_SERVER_CLIENT_MAX; i++) ws.disconnect(i);
+    printInfo();
+  }
+  // Settings, stored on the board:
+  //   panel 0 auto|1 ILI9341|2 ST7789, inv 0 auto|1 off|2 on, bgr 0|1 (these reboot)
+  //   rot 0-3, name "...", wifi_ssid + wifi_pass, forget_wifi 1
+  if (!strcmp(cmd, "set")) {
+    bool reboot = false;
+    for (const char* k : {"panel", "inv", "bgr"})
+      if (doc[k].is<int>()) {
+        prefs.putUChar(k, doc[k].as<int>());
+        reboot = true;
+      }
+    if (doc["rot"].is<int>()) {
+      rotation = doc["rot"].as<int>() & 3;
+      prefs.putUChar("rot", rotation);
+      lcd.setRotation(rotation);
+    }
+    if (doc["name"].is<const char*>()) {
+      prefs.putString("name", (const char*)doc["name"]);
+      reboot = true;  // re-announce on mDNS under the new name
+    }
+    if (doc["wifi_ssid"].is<const char*>()) setWifi(doc["wifi_ssid"], doc["wifi_pass"] | "");
+    if (doc["forget_wifi"] | 0) forgetWifi();
+    printInfo();
+    if (reboot) {
+      Serial.flush();
+      ESP.restart();
+    }
+  }
 }
 
 static void pollSerial() {
@@ -516,80 +966,6 @@ static void pollSerial() {
       n = 0;  // overlong line: drop it
     }
   }
-}
-
-// ------------------------------------------------------- touch / backlight --
-
-static uint32_t lastWakeMs = 0;
-static char lastSignature[64] = "";
-
-static void wake() { lastWakeMs = millis(); }
-
-static void pollTouch() {
-  static uint32_t downMs = 0;
-  static bool flipped = false;
-  int32_t x, y;
-  bool down = lcd.getTouch(&x, &y);
-  if (down && !downMs) {
-    downMs = millis();
-    flipped = false;
-  }
-  if (down && !flipped && millis() - downMs > 1500) {  // long press: rotate 180
-    rotation = rotation ^ 2;
-    lcd.setRotation(rotation);
-    prefs.putUChar("rot", rotation);
-    flipped = true;
-  }
-  if (!down && downMs) {
-    if (!flipped && millis() - downMs > 30) {
-      bool wasDim = millis() - lastWakeMs > 10 * 60000;
-      if (!wasDim && nSess > 1) {
-        focus = (focus + 1) % nSess;
-        manualFocusMs = millis();
-      }
-    }
-    wake();
-    downMs = 0;
-  }
-}
-
-static void updateBacklightAndLed() {
-  // Anything changing on screen counts as activity and keeps it bright.
-  char sig[64];
-  snprintf(sig, sizeof sig, "%d|%d|%c|%s", online(), nSess, nSess ? sess[0].state : '-',
-           nSess ? sess[0].verb : "");
-  bool busy = false;
-  for (int i = 0; i < nSess; i++) busy |= sess[i].state != 'i';
-  if (strcmp(sig, lastSignature) || (online() && busy)) {
-    strlcpy(lastSignature, sig, sizeof lastSignature);
-    wake();
-  }
-  uint32_t idle = millis() - lastWakeMs;
-  uint8_t target = idle < 10 * 60000 ? 255 : (online() ? 40 : 6);
-  static float level = 255;
-  level += (target - level) * 0.08f;
-  lcd.setBrightness((uint8_t)level);
-
-  // Back-side RGB LED (active low): breathe amber while Claude waits on you.
-  bool waiting = online() && nSess > 0 && sess[0].state == 'q';
-  float b = waiting ? 0.5f + 0.5f * sinf(T * 4) : 0;
-  ledcWrite(1, 255 - (uint8_t)(b * 255));
-  ledcWrite(2, 255 - (uint8_t)(b * 70));
-  ledcWrite(3, 255);
-}
-
-// ------------------------------------------------------------------ setup --
-
-static uint32_t panelId = 0;
-
-#ifndef FW_VERSION
-#define FW_VERSION "dev"  // release builds pass the git tag
-#endif
-
-static void printInfo() {
-  Serial.printf("PONG claudescreen 2 fw=%s panel=%s id=%06lx inv=%d bgr=%d rot=%d\n", FW_VERSION,
-                lcd.isST7789 ? "st7789" : "ili9341", (unsigned long)panelId, prefs.getUChar("inv", 0),
-                prefs.getUChar("bgr", 0), rotation);
 }
 
 // Read the controller's ID (RDDID): ST7789 answers 85 85 52, ILI9341 mostly
@@ -622,6 +998,7 @@ void setup() {
 
   prefs.begin("claudescreen", false);
   rotation = prefs.getUChar("rot", 1);
+  strlcpy(sources[0].label, "usb", sizeof sources[0].label);
 
   initDisplay();
   lcd.initDMA();
@@ -641,24 +1018,32 @@ void setup() {
   loadFont(fSmall, wSmall, f_small_vlw);
   loadFont(fMono, wMono, f_mono_vlw);
 
+  pinMode(0, INPUT_PULLUP);
+  brightness = prefs.getUChar("bright", 100);
+  loadTouchCalibration();
+  netSetup();
   wake();
   printInfo();
 }
 
 void loop() {
   pollSerial();
+  netLoop();
   pollTouch();
+  pollBootButton();
   T = millis() / 1000.0f;
+  rebuildView();
   updateBacklightAndLed();
 
   // Animate at ~30 fps while something moves, otherwise just tick the timers.
   static uint32_t lastFrame = 0, lastRx = 0;
   bool animating = online() && nSess > 0 && sess[focus].state != 'i';
   animating |= online() && nSess > 0 && sess[0].state == 'q';
+  animating |= netUi.pairing || bootHeldMs;
   uint32_t interval = animating ? 33 : 250;
-  if (millis() - lastFrame >= interval || rxMs != lastRx || shotRequested) {
+  if (millis() - lastFrame >= interval || lastRxMs != lastRx || shotRequested) {
     lastFrame = millis();
-    lastRx = rxMs;
+    lastRx = lastRxMs;
     renderFrame();
   }
   delay(1);
