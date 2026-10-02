@@ -1,0 +1,101 @@
+name: Build
+
+# Every push and PR builds the firmware. Pushing a tag like v1.2.0 also
+# publishes a GitHub release with a ready-to-flash image and the PC bridge.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ hashFiles('firmware/platformio.ini') }}
+
+      - name: Install tools
+        run: pip install platformio esptool
+
+      - name: Version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=dev-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build firmware
+        working-directory: firmware
+        env:
+          PLATFORMIO_BUILD_FLAGS: -DFW_VERSION=\"${{ steps.version.outputs.version }}\"
+        run: pio run -e cyd
+
+      - name: Package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p dist
+          B=firmware/.pio/build/cyd
+          BOOT_APP0=$(find ~/.platformio/packages/framework-arduinoespressif32 -name boot_app0.bin | head -1)
+          # One image that flashes at offset 0x0: bootloader, partitions, OTA data, app.
+          python -m esptool --chip esp32 merge-bin -o "dist/claudescreen-${VERSION}-full.bin" \
+            --flash-mode dio --flash-freq 40m --flash-size 4MB \
+            0x1000 $B/bootloader.bin 0x8000 $B/partitions.bin 0xe000 "$BOOT_APP0" 0x10000 $B/firmware.bin
+          # App only, for updating a board that already runs ClaudeScreen (offset 0x10000).
+          cp $B/firmware.bin "dist/claudescreen-${VERSION}-app.bin"
+          # The PC side.
+          zip -r "dist/claudescreen-bridge-${VERSION}.zip" bridge README.md -x '*/__pycache__/*'
+          (cd dist && sha256sum * > SHA256SUMS.txt)
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: claudescreen-${{ steps.version.outputs.version }}
+          path: dist/
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          cat > notes.md <<EOF
+          ## Flashing
+
+          **New board** (or switching from other firmware), flash the full image at offset 0:
+
+          \`\`\`bash
+          pip install esptool
+          python -m esptool --chip esp32 write-flash 0x0 claudescreen-${VERSION}-full.bin
+          \`\`\`
+
+          **Updating ClaudeScreen**, the app image is enough and keeps your display settings:
+
+          \`\`\`bash
+          python -m esptool --chip esp32 write-flash 0x10000 claudescreen-${VERSION}-app.bin
+          \`\`\`
+
+          Hold **BOOT** if esptool reports *Wrong boot mode*. Then unzip the bridge and run
+          \`python bridge/install.py\`.
+          EOF
+          sed -i 's/^          //' notes.md
+          gh release create "$VERSION" dist/* --title "ClaudeScreen $VERSION" \
+            --notes-file notes.md --generate-notes --verify-tag

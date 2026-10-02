@@ -582,8 +582,12 @@ static void updateBacklightAndLed() {
 
 static uint32_t panelId = 0;
 
+#ifndef FW_VERSION
+#define FW_VERSION "dev"  // release builds pass the git tag
+#endif
+
 static void printInfo() {
-  Serial.printf("PONG claudescreen 2 panel=%s id=%06lx inv=%d bgr=%d rot=%d\n",
+  Serial.printf("PONG claudescreen 2 fw=%s panel=%s id=%06lx inv=%d bgr=%d rot=%d\n", FW_VERSION,
                 lcd.isST7789 ? "st7789" : "ili9341", (unsigned long)panelId, prefs.getUChar("inv", 0),
                 prefs.getUChar("bgr", 0), rotation);
 }

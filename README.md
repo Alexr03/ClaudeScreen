@@ -11,6 +11,8 @@ and how much of your plan you've used, on a $15 ESP32 touchscreen.
 ![PlatformIO](https://img.shields.io/badge/PlatformIO-firmware-F5822A?style=flat-square&logo=platformio&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat-square&logo=python&logoColor=white)
 ![Windows](https://img.shields.io/badge/Windows-USB%20serial-0078D4?style=flat-square&logo=windows&logoColor=white)
+[![Build](https://img.shields.io/github/actions/workflow/status/Alexr03/ClaudeScreen/build.yml?style=flat-square&label=build)](https://github.com/Alexr03/ClaudeScreen/actions/workflows/build.yml)
+[![Release](https://img.shields.io/github/v/release/Alexr03/ClaudeScreen?style=flat-square&color=D97757)](https://github.com/Alexr03/ClaudeScreen/releases/latest)
 
 </div>
 
@@ -83,13 +85,23 @@ flowchart LR
 
 ### 1. Flash the firmware
 
+**From a release (no build tools needed):** download `claudescreen-<version>-full.bin` from the
+[latest release](https://github.com/Alexr03/ClaudeScreen/releases/latest), then:
+
+```bash
+pip install esptool
+python -m esptool --chip esp32 write-flash 0x0 claudescreen-<version>-full.bin
+```
+
+**From source:**
+
 ```bash
 pip install platformio
 cd firmware
 pio run -t upload
 ```
 
-If the upload says *"Wrong boot mode detected"*, hold the **BOOT** button while it connects.
+If flashing says *"Wrong boot mode detected"*, hold the **BOOT** button while it connects.
 
 ### 2. Install the bridge
 
@@ -191,3 +203,24 @@ Commands: `{"cmd":"ping"}`, `{"cmd":"shot"}` (sends back `SHOT w h` followed by 
 pixel data), and `{"cmd":"set", "panel":…, "inv":…, "bgr":…, "rot":…}`.
 
 </details>
+
+## Releases
+
+Push a version tag and GitHub Actions builds and publishes a release:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+Each release contains:
+
+| File | |
+|---|---|
+| `claudescreen-<version>-full.bin` | Complete flash image, write at `0x0` |
+| `claudescreen-<version>-app.bin` | App only, write at `0x10000` to update and keep display settings |
+| `claudescreen-bridge-<version>.zip` | The PC bridge |
+| `SHA256SUMS.txt` | Checksums |
+
+Every push to `main` also builds the firmware, and the result is attached to the workflow run.
+The board reports its firmware version in `python bridge/display_config.py`.
