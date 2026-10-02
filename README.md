@@ -180,13 +180,14 @@ python bridge/display_config.py panel=2 inv=1
 ## On the device
 
 - **Tap** to cycle through sessions.
-- **Hold for a second** to open **Settings**:
+- **Hold for a second** to open **Settings** (drag to scroll):
 
   | | |
   |---|---|
   | WiFi | the network it's on; tap to forget it, or to start WiFi setup |
   | Paired PCs | how many; tap to forget them all |
   | Brightness | 100% · 70% · 40% |
+  | Status light | the RGB LED on the back: on (pulses amber when Claude needs you) or off |
   | Rotate screen | flip 180° |
   | Factory reset | forgets WiFi, paired PCs and settings |
 

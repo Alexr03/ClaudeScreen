@@ -119,8 +119,14 @@ static bool menuOpen = false;
 static Confirm menuConfirm = C_NONE;
 static uint32_t menuTouchMs = 0;  // closes itself after a minute untouched
 static uint8_t brightness = 100;  // percent
+static bool statusLed = true;     // RGB LED on the back
 static uint32_t bootHeldMs = 0;   // BOOT button held: factory reset countdown
-static constexpr int MENU_ROW_Y = 42, MENU_ROW_H = 34, MENU_ROW_GAP = 4;
+static constexpr int MENU_ROW_Y = 42, MENU_ROW_H = 34, MENU_ROW_GAP = 4, MENU_ROWS = 6;
+static int menuScroll = 0;  // px; drag the list to scroll
+
+static int menuMaxScroll() {
+  return max(0, MENU_ROW_Y + MENU_ROWS * (MENU_ROW_H + MENU_ROW_GAP) + 2 - 240);  // 240 = screen height
+}
 
 // ------------------------------------------------------------- hardware --
 
@@ -498,18 +504,12 @@ static void button(int x, int y, int w, int h, const char* label, uint16_t bg, u
 
 static void drawMenu() {
   char buf[64];
-  text(fTitle, "Settings", 16, 25, C_TEXT);
-  snprintf(buf, sizeof buf, "%s  \xC2\xB7  %s", netUi.hostname, FW_VERSION_STR);
-  text(fSmall, buf, 16 + textW(fTitle, "Settings") + 10, 24, C_DIM);
-  disc(294, 18, 13, C_CARD);  // close button
-  capsule(289, 13, 299, 23, 1.2f, C_MUTED);
-  capsule(299, 13, 289, 23, 1.2f, C_MUTED);
-
-  const char* labels[] = {"WiFi", "Paired PCs", "Brightness", "Rotate screen", "Factory reset"};
-  for (int i = 0; i < 5; i++) {
-    int y = MENU_ROW_Y + i * (MENU_ROW_H + MENU_ROW_GAP);
+  const char* labels[MENU_ROWS] = {"WiFi", "Paired PCs", "Brightness", "Status light", "Rotate screen", "Factory reset"};
+  for (int i = 0; i < MENU_ROWS; i++) {
+    int y = MENU_ROW_Y + i * (MENU_ROW_H + MENU_ROW_GAP) - menuScroll;
+    if (y + MENU_ROW_H < MENU_ROW_Y - 4 || y > H) continue;
     rrect(8, y, 304, MENU_ROW_H, 9, C_CARD);
-    text(fBody, labels[i], 20, y + 22, i == 4 ? C_RED : C_TEXT);
+    text(fBody, labels[i], 20, y + 22, i == 5 ? C_RED : C_TEXT);
     buf[0] = 0;
     if (i == 0) {
       if (netUi.wifi) snprintf(buf, sizeof buf, "%s  \xC2\xB7  %s", netUi.ssid, netUi.ip);
@@ -517,9 +517,27 @@ static void drawMenu() {
     }
     if (i == 1) snprintf(buf, sizeof buf, "%d  \xC2\xB7  tap to forget all", pairedCount());
     if (i == 2) snprintf(buf, sizeof buf, "%d%%", brightness);
+    if (i == 3) strlcpy(buf, statusLed ? "on  \xC2\xB7  pulses when Claude needs you" : "off", sizeof buf);
     char line[64];
     if (*buf) text(fSmall, fit(fSmall, buf, 190, line, sizeof line), 300, y + 22, C_MUTED, textdatum_t::baseline_right);
   }
+
+  // Scroll indicator, when the rows don't all fit.
+  int maxScroll = menuMaxScroll();
+  if (maxScroll > 0) {
+    float view = H - MENU_ROW_Y, total = view + maxScroll;
+    float th = view * view / total, ty = MENU_ROW_Y + (view - th) * menuScroll / maxScroll;
+    capsule(316, ty + 3, 316, ty + th - 3, 1.5f, C_TRACK);
+  }
+
+  // Header on top, so rows scroll underneath it.
+  if (OY < MENU_ROW_Y - 4) S->fillRect(0, -OY, W, MENU_ROW_Y - 4, C_BG);
+  text(fTitle, "Settings", 16, 25, C_TEXT);
+  snprintf(buf, sizeof buf, "%s  \xC2\xB7  %s", netUi.hostname, FW_VERSION_STR);
+  text(fSmall, buf, 16 + textW(fTitle, "Settings") + 10, 24, C_DIM);
+  disc(294, 18, 13, C_CARD);  // close button
+  capsule(289, 13, 299, 23, 1.2f, C_MUTED);
+  capsule(299, 13, 289, 23, 1.2f, C_MUTED);
 
   if (menuConfirm != C_NONE) {
     const char* title = menuConfirm == C_FORGET_WIFI ? "Forget WiFi?"
@@ -709,7 +727,8 @@ static void menuTap(int x, int y);
 static void pollTouch() {
   static uint32_t downMs = 0;
   static bool held = false;
-  static int32_t tx = 0, ty = 0;
+  static int32_t tx = 0, ty = 0, startY = 0, startScroll = 0;
+  static bool dragging = false;
   int32_t x, y;
   bool down = lcd.getTouch(&x, &y);
   if (down) {
@@ -719,6 +738,16 @@ static void pollTouch() {
   if (down && !downMs) {
     downMs = millis();
     held = false;
+    dragging = false;
+    startY = y;
+    startScroll = menuScroll;
+  }
+  // In the menu, a vertical drag scrolls the list instead of tapping.
+  if (down && menuOpen && menuConfirm == C_NONE && (dragging || abs(y - startY) > 8)) {
+    dragging = true;
+    held = true;  // so releasing doesn't count as a tap
+    menuScroll = constrain(startScroll - (y - startY), 0, menuMaxScroll());
+    menuTouchMs = millis();
   }
   if (down && !held && !menuOpen && millis() - downMs > 1000) {  // long press: settings
     held = true;
@@ -760,7 +789,7 @@ static void updateBacklightAndLed() {
   lcd.setBrightness((uint8_t)level);
 
   // Back-side RGB LED (active low): breathe amber while Claude waits on you.
-  bool waiting = online() && nSess > 0 && sess[0].state == 'q';
+  bool waiting = statusLed && online() && nSess > 0 && sess[0].state == 'q';
   float b = waiting ? 0.5f + 0.5f * sinf(T * 4) : 0;
   ledcWrite(1, 255 - (uint8_t)(b * 255));
   ledcWrite(2, 255 - (uint8_t)(b * 70));
@@ -819,6 +848,7 @@ static void openMenu() {
   if (!prefs.isKey("tcal")) calibrateTouch();
   menuOpen = true;
   menuConfirm = C_NONE;
+  menuScroll = 0;
   menuTouchMs = millis();
 }
 
@@ -864,8 +894,10 @@ static void menuTap(int x, int y) {
     menuOpen = false;
     return;
   }
-  int row = (y - MENU_ROW_Y) / (MENU_ROW_H + MENU_ROW_GAP);
-  if (y < MENU_ROW_Y || row > 4) return;
+  if (y < MENU_ROW_Y - 4) return;  // header
+  int pos = y - MENU_ROW_Y + menuScroll;
+  int row = pos / (MENU_ROW_H + MENU_ROW_GAP);
+  if (pos < 0 || row >= MENU_ROWS || pos % (MENU_ROW_H + MENU_ROW_GAP) > MENU_ROW_H) return;
   switch (row) {
     case 0:
       if (netUi.wifi) menuConfirm = C_FORGET_WIFI;
@@ -879,11 +911,15 @@ static void menuTap(int x, int y) {
       prefs.putUChar("bright", brightness);
       break;
     case 3:
+      statusLed = !statusLed;
+      prefs.putBool("led", statusLed);
+      break;
+    case 4:
       rotation ^= 2;
       lcd.setRotation(rotation);
       prefs.putUChar("rot", rotation);
       break;
-    case 4: menuConfirm = C_RESET; break;
+    case 5: menuConfirm = C_RESET; break;
   }
 }
 
@@ -1026,6 +1062,7 @@ void setup() {
 
   pinMode(0, INPUT_PULLUP);
   brightness = prefs.getUChar("bright", 100);
+  statusLed = prefs.getBool("led", true);
   loadTouchCalibration();
   netSetup();
   wake();
@@ -1045,7 +1082,7 @@ void loop() {
   static uint32_t lastFrame = 0, lastRx = 0;
   bool animating = online() && nSess > 0 && sess[focus].state != 'i';
   animating |= online() && nSess > 0 && sess[0].state == 'q';
-  animating |= netUi.pairing || bootHeldMs;
+  animating |= netUi.pairing || bootHeldMs || menuOpen;  // menu: smooth scrolling
   uint32_t interval = animating ? 33 : 250;
   if (millis() - lastFrame >= interval || lastRxMs != lastRx || shotRequested) {
     lastFrame = millis();
