@@ -122,7 +122,10 @@ class Session:
 
     @property
     def name(self):
-        return os.path.basename(self.cwd.rstrip("/\\")) or "session"
+        # The transcript's first cwd is where the session started; self.cwd may
+        # be a subfolder if the SessionStart event fell outside the replay window.
+        cwd = transcript_start_dir(self.transcript) or self.cwd
+        return os.path.basename(cwd.rstrip("/\\")) or "session"
 
 
 class Tracker:
@@ -299,6 +302,30 @@ def fetch_usage():
     with open(path + ".tmp", "w", encoding="utf-8") as f:
         json.dump({"ts": time.time(), "source": "api", "rate_limits": limits}, f)
     os.replace(path + ".tmp", path)
+
+
+_start_dir_cache = {}
+
+
+def transcript_start_dir(path):
+    """The cwd recorded at the top of a session transcript (read once)."""
+    if not path:
+        return ""
+    if path not in _start_dir_cache:
+        cwd = ""
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for _, line in zip(range(20), f):
+                    try:
+                        cwd = json.loads(line).get("cwd") or ""
+                    except ValueError:
+                        continue
+                    if cwd:
+                        break
+        except OSError:
+            return ""  # not written yet: try again next time
+        _start_dir_cache[path] = cwd
+    return _start_dir_cache[path]
 
 
 _model_cache = {}
