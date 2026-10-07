@@ -516,13 +516,18 @@ def run(args):
             print(f"WiFi screens disabled ({e}); pip install zeroconf websocket-client", flush=True)
 
     last_sent, last_payload, next_usage = 0.0, None, 0.0
+    usage_backoff = USAGE_EVERY
     while True:
         now = time.time()
         if not args.demo and now >= next_usage:
             next_usage = now + USAGE_EVERY
             try:
                 fetch_usage()
+                usage_backoff = USAGE_EVERY
             except Exception as e:  # keep whatever the status line last gave us
+                if getattr(e, "code", None) == 429:  # rate limited: back off, up to an hour
+                    usage_backoff = min(usage_backoff * 2, 3600)
+                    next_usage = now + usage_backoff
                 print(f"usage check failed: {type(e).__name__}: {e}", flush=True)
 
         if args.demo:
