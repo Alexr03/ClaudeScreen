@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 
@@ -20,6 +21,7 @@ STATE_DIR = os.path.join(CLAUDE, "claude-screen")
 CONFIG = os.path.join(STATE_DIR, "config.json")
 STARTUP = os.path.join(os.environ.get("APPDATA", ""), r"Microsoft\Windows\Start Menu\Programs\Startup")
 LAUNCHER = os.path.join(STARTUP, "ClaudeScreen.vbs")
+TASK = "ClaudeScreen watchdog"
 
 EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PermissionRequest",
           "Notification", "Stop", "StopFailure", "SessionEnd"]
@@ -82,6 +84,11 @@ def install():
         with open(LAUNCHER, "w", encoding="utf-8") as f:
             f.write(f'CreateObject("WScript.Shell").Run "{cmd}", 0, False\n')
         print(f"bridge will start at login ({LAUNCHER})")
+        # Watchdog: relaunch every 5 minutes; the bridge exits at once if it's
+        # already running, so this only matters after a crash or freeze.
+        subprocess.run(["schtasks", "/create", "/f", "/tn", TASK, "/sc", "minute", "/mo", "5",
+                        "/tr", f'wscript.exe //B //Nologo "{LAUNCHER}"'], capture_output=True)
+        print(f"watchdog task '{TASK}' restarts it if it stops")
 
 
 def remove():
@@ -102,6 +109,7 @@ def remove():
     if os.path.exists(LAUNCHER):
         os.remove(LAUNCHER)
         print("removed login launcher")
+    subprocess.run(["schtasks", "/delete", "/f", "/tn", TASK], capture_output=True)
 
 
 if __name__ == "__main__":

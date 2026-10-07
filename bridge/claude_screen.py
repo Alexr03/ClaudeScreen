@@ -419,6 +419,7 @@ def find_port():
 def open_port(port):
     ser = serial.Serial()
     ser.port, ser.baudrate, ser.timeout = port, BAUD, 0
+    ser.write_timeout = 2  # a board that stops reading must not freeze the bridge
     ser.dtr = False  # don't toggle the auto-reset circuit when opening
     ser.rts = False
     ser.open()
@@ -584,6 +585,15 @@ def main():
             ap.error("unpair needs a screen name or id")
         return network.unpair(args.target)
 
+    if not args.shot and not args.demo:
+        # One bridge per PC: the watchdog task relaunches it every few minutes,
+        # and this makes that a no-op while one is already running.
+        global _instance_lock
+        _instance_lock = socket.socket()
+        try:
+            _instance_lock.bind(("127.0.0.1", 47823))
+        except OSError:
+            return 0
     setup_logging()
     if args.shot:
         ser = open_port(args.port or find_port())
