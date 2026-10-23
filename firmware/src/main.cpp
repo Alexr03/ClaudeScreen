@@ -88,6 +88,8 @@ static uint32_t lastRxMs = 0;  // newest update from any source
 static bool everConnected = false;
 static bool multiSource = false;  // more than one PC live: label sessions
 
+static uint32_t lastWakeMs = 0;     // last touch or on-screen change
+
 static int focus = 0;               // which session the hero card shows
 static uint32_t manualFocusMs = 0;  // non-zero while the user picked one by tapping
 static uint8_t focusSrc = 0;
@@ -567,11 +569,81 @@ static void drawResetCountdown() {
   text(fSmall, "release to cancel", 160, 146, C_DIM, textdatum_t::baseline_center);
 }
 
+// --------------------------------------------------------------- splash --
+// Once nothing has changed for a minute, Clawd (the Claude Code mascot) loops
+// through a little routine. Any activity or a tap brings the dashboard back.
+
+static constexpr uint32_t SPLASH_MS = 60000;
+
+static bool splashing() {
+  return online() && !menuOpen && !netUi.pairing && !bootHeldMs && millis() - lastWakeMs > SPLASH_MS;
+}
+
+static void block(float x, float y, float w, float h, uint16_t col) {
+  S->fillRect(lroundf(x), lroundf(y) - OY, lroundf(w), lroundf(h), col);
+}
+
+// Clawd standing on `gy`, centred on `cx`, drawn on a 16x9 grid of U px cells.
+// step: -1..1 lifts one pair of legs or the other; wave: 0..1 raises an arm.
+static void clawd(float cx, float gy, float lift, float look, float blink, float wave, float step) {
+  const float U = 9, x0 = cx - 8 * U, top = gy - 9 * U - lift;
+  float sw = 20 + 112 * clamp01(1 - lift / 60);  // shadow shrinks as it rises
+  rrect(cx - sw / 2, gy - 3, sw, 7, 3, C_CARD);
+  static const int legs[4] = {3, 5, 10, 12};
+  for (int i = 0; i < 4; i++) {
+    float up = max(0.0f, (i % 2 ? -step : step)) * U * 0.7f;
+    block(x0 + legs[i] * U, top + 7 * U, U, 2 * U - up, C_CORAL);
+  }
+  block(x0 + 2 * U, top, 12 * U, 7 * U, C_CORAL);
+  block(x0, top + 3 * U, 2 * U, U, C_CORAL);
+  block(x0 + 14 * U, top + 3 * U - wave * (2 * U + 0.7f * U * sinf(T * 12)), 2 * U, U, C_CORAL);
+  float eh = max(2.0f, 2 * U * (1 - blink));
+  block(x0 + 4 * U + look, top + 3 * U - eh / 2, U, eh, C_BG);
+  block(x0 + 11 * U + look, top + 3 * U - eh / 2, U, eh, C_BG);
+}
+
+static void drawSplash() {
+  static const float sx[3] = {46, 274, 250}, sy[3] = {58, 40, 120};
+  for (int i = 0; i < 3; i++)
+    spark(sx[i], sy[i], 5, mix(C_BG, C_DIM, 0.5f + 0.5f * sinf(T * 1.3f + i * 2.1f)), 0, 0, 0);
+
+  // A 32 s routine: breathe, look around, hop, stroll off and back, wave, nap.
+  const float gy = 168, t = fmodf(T, 32);
+  float cx = W / 2, lift = 1.5f + 1.5f * sinf(T * 2), look = 0, wave = 0, step = 0;
+  float blink = fmodf(T, 3.7f) < 0.14f ? 1 : 0;
+  if (t >= 6 && t < 10) {
+    look = 7 * sinf((t - 6) * PI / 2);
+  } else if (t >= 10 && t < 13) {
+    lift = 34 * fabsf(sinf((t - 10) * PI));
+  } else if (t >= 13 && t < 21) {
+    cx += (t - 13) / 8 * (W + 160);
+    if (cx > W + 80) cx -= W + 160;  // wrap round from the left edge
+    step = sinf((t - 13) * 4 * PI);
+    lift = fabsf(step) * 2;
+    look = 5;
+  } else if (t >= 21 && t < 25) {
+    wave = clamp01(min(t - 21, 25 - t) * 3);
+  } else if (t >= 25) {
+    blink = 1;
+    lift = 1 + sinf(T * 1.2f);
+    for (int k = 0; k < 3; k++) {
+      float p = fmodf((t - 25) * 0.5f + k / 3.0f, 1);
+      text(fBody, "z", cx + 56 + p * 30, gy - 92 - p * 46, mix(C_BG, C_MUTED, sinf(p * PI)));
+    }
+  }
+  clawd(cx, gy, lift, look, blink, wave, step);
+  if (*clockStr) text(fTitle, clockStr, W / 2, 216, C_DIM, textdatum_t::baseline_center);
+}
+
 static void drawScene() {
   S->fillSprite(C_BG);
   if (menuOpen) {
     drawMenu();
     if (bootHeldMs) drawResetCountdown();
+    return;
+  }
+  if (splashing()) {
+    drawSplash();
     return;
   }
   drawHeader();
@@ -719,7 +791,6 @@ static void rebuildView() {
 
 // ------------------------------------------------------- touch / backlight --
 
-static uint32_t lastWakeMs = 0;
 static char lastSignature[64] = "";
 
 static void wake() { lastWakeMs = millis(); }
@@ -757,8 +828,8 @@ static void pollTouch() {
     openMenu();
   }
   if (!down && downMs) {
-    bool wasDim = millis() - lastWakeMs > 10 * 60000;
-    if (!held && millis() - downMs > 30 && !wasDim) {
+    bool asleep = millis() - lastWakeMs > SPLASH_MS;  // splash or dimmed: a tap only wakes
+    if (!held && millis() - downMs > 30 && !asleep) {
       if (menuOpen) {
         menuTap(tx, ty);
       } else if (nSess > 1) {
@@ -1089,7 +1160,7 @@ void loop() {
   static uint32_t lastFrame = 0, lastRx = 0;
   bool animating = online() && nSess > 0 && sess[focus].state != 'i';
   animating |= online() && nSess > 0 && sess[0].state == 'q';
-  animating |= netUi.pairing || bootHeldMs || menuOpen;  // menu: smooth scrolling
+  animating |= netUi.pairing || bootHeldMs || menuOpen || splashing();  // menu: smooth scrolling
   uint32_t interval = animating ? 33 : 250;
   if (millis() - lastFrame >= interval || lastRxMs != lastRx || shotRequested) {
     lastFrame = millis();
